@@ -3,29 +3,24 @@
 //      https://github.com/meteor/meteor/issues/9865
 Npm.require('app-module-path/cwd');
 
-import {checkNpmVersions} from 'meteor/tmeasday:check-npm-versions';
+import { checkNpmVersions } from 'meteor/tmeasday:check-npm-versions';
 import Future from 'fibers/future';
 
 var sourcemap = Npm.require('source-map');
 
 checkNpmVersions({
-  'postcss': '^6.0.22',
-  'postcss-load-config': '^1.2.0'
+    'postcss': '^7.0.0',
 }, 'juliancwirko:postcss');
 
 var postCSS = require('postcss');
-var load = require('postcss-load-config');
+var postcssrc = require('postcss-load-config');
 
-// Not used, but available.
-var fs = Plugin.fs;
-var path = Plugin.path;
 
 Plugin.registerMinifier({
     extensions: ['css']
-}, function () {
-    const minifier = new CssToolsMinifier();
-    return minifier;
-});
+},
+    () => new CssToolsMinifier()
+);
 
 var loaded = false;
 var postcssConfigPlugins = [];
@@ -38,7 +33,8 @@ var loadPostcssConfig = function () {
 
         var config;
         try {
-            config = Promise.await(load({meteor: true}));
+            config = Promise.await(postcssrc({ meteor: true }));
+
             postcssConfigPlugins = config.plugins || [];
             postcssConfigParser = config.options.parser || null;
             postcssConfigExcludedPackages = config.options.excludedPackages || [];
@@ -67,48 +63,58 @@ var isNotInExcludedPackages = function (excludedPackages, pathInBundle) {
 };
 
 var isNotImport = function (inputFileUrl) {
-    return !(/\.import\.css$/.test(inputFileUrl) ||
-             /(?:^|\/)imports\//.test(inputFileUrl));
+    return !(/\.import\.css$/.test(inputFileUrl) || /(?:^|\/)imports\//.test(inputFileUrl));
 };
 
-function CssToolsMinifier() {};
+class CssToolsMinifier {
 
-CssToolsMinifier.prototype.processFilesForBundle = function (files, options) {
-    loadPostcssConfig();
+    constructor() { }
 
-    var mode = options.minifyMode;
+    processFilesForBundle(files, options) {
+        console.log(files);
+        console.log(options);
 
-    if (!files.length) return;
+        loadPostcssConfig();
 
-    var filesToMerge = [];
+        var mode = options.minifyMode;
 
-    files.forEach(function (file) {
-        if (isNotImport(file._source.url)) {
-            filesToMerge.push(file);
+        if (!files.length) {
+            return;
         }
-    });
 
-    var merged = mergeCss(filesToMerge);
+        var filesToMerge = [];
 
-    if (mode === 'development') {
-        files[0].addStylesheet({
-            data: merged.code,
-            sourceMap: merged.sourceMap,
-            path: 'merged-stylesheets.css'
+        files.forEach(function (file) {
+            if (isNotImport(file._source.url)) {
+                filesToMerge.push(file);
+            }
         });
-        return;
-    }
 
-    var minifiedFiles = CssTools.minifyCss(merged.code);
+        var merged = mergeCss(filesToMerge);
 
-    if (files.length) {
-        minifiedFiles.forEach(function (minified) {
+        if (mode === 'development') {
             files[0].addStylesheet({
-                data: minified
+                data: merged.code,
+                sourceMap: merged.sourceMap,
+                path: 'merged-stylesheets.css'
             });
-        });
+            return;
+        }
+
+        // this is where the minification is 
+        // perfromed when in production
+        // mode
+        var minifiedFiles = CssTools.minifyCss(merged.code);
+
+        if (files.length) {
+            minifiedFiles.forEach(function (minified) {
+                files[0].addStylesheet({
+                    data: minified
+                });
+            });
+        }
     }
-};
+}
 
 // Lints CSS files and merges them into one file, fixing up source maps and
 // pulling any @import directives up to the top since the CSS spec does not
@@ -117,76 +123,76 @@ var mergeCss = function (css) {
     // Filenames passed to AST manipulator mapped to their original files
     var originals = {};
 
+    // css is an array of files
     var cssAsts = css.map(function (file) {
-        var filename = file.getPathInBundle();
-        originals[filename] = file;
+        var filePath = file.getPathInBundle();
+        originals[filePath] = file;
 
-        var f = new Future;
+        var future = new Future();
 
-        var css;
-        var postres;
-        var isFileForPostCSS;
+        // check if the file is in a package that was excluded from being processed
+        const isFileForPostCSS = isNotInExcludedPackages(postcssConfigExcludedPackages, filePath);
 
-        if (isNotInExcludedPackages(postcssConfigExcludedPackages, file.getPathInBundle())) {
-            isFileForPostCSS = true;
-        } else {
-            isFileForPostCSS = false;
-        }
+        // when a file is not meant to have postcss used on it we pass in no plugins
+        // which takes the form of an empty array
+        const postCssPlugins = isFileForPostCSS ? postcssConfigPlugins : [];
 
-        postCSS(isFileForPostCSS ? postcssConfigPlugins : [])
-            .process(file.getContentsAsString(), {
-                from: process.cwd() + file._source.url,
-                parser: postcssConfigParser
-            })
+        // create a postcss processor using the configured plugins
+        const processor = postCSS(postCssPlugins);
+
+        processor.process(file.getContentsAsString(), {
+            from: process.cwd() + file._source.url,
+            parser: postcssConfigParser
+        })
             .then(function (result) {
                 result.warnings().forEach(function (warn) {
                     process.stderr.write(warn.toString());
                 });
-                f.return(result);
+                future.return(result);
             })
             .catch(function (error) {
                 var errMsg = error.message;
                 if (error.name === 'CssSyntaxError') {
-                    errMsg = error.message + '\n\n' + 'Css Syntax Error.' + '\n\n' + error.message + error.showSourceCode()
+                    errMsg = error.message + '\n\n' + 'Css Syntax Error.' + '\n\n' + error.message + error.showSourceCode();
                 }
                 error.message = errMsg;
-                f.return(error);
+                future.return(error);
             });
 
         try {
+
             var parseOptions = {
-                source: filename,
+                from: filePath,
                 position: true
             };
 
-            postres = f.wait();
 
-            if (postres.name === 'CssSyntaxError') {
-                throw postres;
+            var postCssResult = future.wait();
+
+            if (postCssResult.name === 'CssSyntaxError') {
+                throw postCssResult;
             }
 
-            css = postres.css;
+            // now call the meteor built in minifier  (which is actually postcss as well)
+            var ast = CssTools.parseCss(postCssResult.css, parseOptions);
+        } catch (err) {
 
-            var ast = CssTools.parseCss(css, parseOptions);
-            ast.filename = filename;
-        } catch (e) {
-
-            if (e.name === 'CssSyntaxError') {
+            if (err.name === 'CssSyntaxError') {
                 file.error({
-                    message: e.message,
-                    line: e.line,
-                    column: e.column
+                    message: err.message,
+                    line: err.line,
+                    column: err.column
                 });
-            } else if (e.reason) {
+            } else if (err.reason) {
                 file.error({
-                    message: e.reason,
-                    line: e.line,
-                    column: e.column
+                    message: err.reason,
+                    line: err.line,
+                    column: err.column
                 });
             } else {
                 // Just in case it's not the normal error the library makes.
                 file.error({
-                    message: e.message
+                    message: err.message
                 });
             }
 
@@ -195,7 +201,7 @@ var mergeCss = function (css) {
                 stylesheet: {
                     rules: []
                 },
-                filename: filename
+                filename: filePath
             };
         }
 
